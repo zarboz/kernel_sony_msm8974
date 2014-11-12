@@ -20,7 +20,7 @@
 #include <linux/delay.h>
 #include <linux/miscdevice.h>
 #include <linux/clearpad.h>
-/*#include <linux/input/evdt_helper.h>*/
+#include <linux/input/evgen_helper.h>
 #include <mach/gpio.h>
 #include <linux/ctype.h>
 #include <linux/firmware.h>
@@ -38,7 +38,10 @@
 #ifdef CONFIG_ARM
 #include <asm/mach-types.h>
 #endif
+
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
 #include <linux/lcd_notify.h>
+#endif
 
 #define SYNAPTICS_CLEARPAD_VENDOR		0x1
 #define SYNAPTICS_MAX_N_FINGERS			10
@@ -68,7 +71,6 @@
 #define HWTEST_SIZE_OF_ONE_HIGH_RX		3
 #define HWTEST_SIZE_OF_TX_TO_TX_SHORT(x)	(((x) + 7) / 8)
 #define SYNAPTICS_WATCHDOG_POLL_DEFAULT_INTERVAL HZ
-#define SYNAPTICS_WAKEUP_GESTURE		"wakeup_gesture"
 
 #define SYN_ADDRESS(th, func, type, addr) ((th)->pdt[func].base[type] + (addr))
 #define SYN_PAGE(th, func) ((th)->pdt[func].page)
@@ -437,6 +439,7 @@ struct synaptics_clearpad {
 	struct synaptics_function_descriptor pdt[SYN_N_FUNCTIONS];
 	struct synaptics_flash_image flash;
 	struct synaptics_easy_wakeup_config easy_wakeup_config;
+	struct evgen_block *evgen_blocks;
 	bool fwdata_available;
 	enum synaptics_flash_modes flash_mode;
 	struct synaptics_extents extents;
@@ -464,8 +467,6 @@ struct synaptics_clearpad {
 	u32 touch_pressure_enabled;
 	u32 touch_size_enabled;
 	u32 touch_orientation_enabled;
-	struct device_node *evdt_node;
-	u32 wakeup_gesture_support;
 	unsigned long ew_timeout;
 	struct delayed_work wd_poll_work;
 	int wd_poll_t_jf;
@@ -478,8 +479,45 @@ struct synaptics_clearpad {
 	const char *reset_cause;
 };
 
-bool lcd_on;
-unsigned long d2w_timeout;
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
+#define DOUBLE_TAP_TO_WAKE_TIMEOUT 700
+/* Hits on different areas shouldn't register as a double tap (e.g top and bottom) */
+#define DOUBLE_TAP_TO_WAKE_FEATHER 200
+/* Screen will always be on after boot */
+bool lcd_on = true;
+static cputime64_t d2w_previous_time = 0;
+static int previous_x, previous_y;
+
+static struct evgen_record double_tap[] = {
+	{
+		.type = EVGEN_LOG,
+		.data.log.message = "=== DOUBLE TAP ===",
+	},
+	{
+		.type = EVGEN_KEY,
+		.data.key.code = KEY_POWER,
+		.data.key.down = true,
+	},
+	{
+		.type = EVGEN_KEY,
+		.data.key.code = KEY_POWER,
+		.data.key.down = false,
+	},
+	{
+		.type = EVGEN_END,
+	},
+};
+
+static struct evgen_block evgen_blocks[] = {
+	{
+		.name = "double_tap",
+		.records = double_tap,
+	},
+	{
+		.name = NULL,
+		.records = NULL,
+	}
+};
 
 static struct notifier_block d2w_lcd_notif;
 
@@ -491,7 +529,7 @@ static int lcd_notifier_callback(struct notifier_block *this, unsigned long even
 		break;
 	case LCD_EVENT_OFF_END:
 		lcd_on = false;
-		d2w_timeout = jiffies -1;
+		d2w_previous_time = 0;
 		break;
 	default:
 		break;
@@ -499,6 +537,23 @@ static int lcd_notifier_callback(struct notifier_block *this, unsigned long even
 
 	return 0;
 }
+
+/* From doubletap2wake.c */
+static unsigned int calc_feather(int coord, int prev_coord)
+{
+	int calc_coord = 0;
+	calc_coord = coord-prev_coord;
+	if (calc_coord < 0)
+		calc_coord = calc_coord * (-1);
+	return calc_coord;
+}
+
+static bool is_close_to_previous_hit(int x, int y)
+{
+	return (calc_feather(x, previous_x) < DOUBLE_TAP_TO_WAKE_FEATHER)
+		&& (calc_feather(y, previous_y) < DOUBLE_TAP_TO_WAKE_FEATHER);
+}
+#endif
 
 static void synaptics_funcarea_initialize(struct synaptics_clearpad *this);
 static void synaptics_clearpad_reset_power(struct synaptics_clearpad *this,
@@ -644,6 +699,15 @@ static struct synaptics_funcarea *clearpad_funcarea_get(
 static int clearpad_flip_config_get(u8 module_id, u8 rev)
 {
 	return SYN_FLIP_NONE;
+}
+
+static struct evgen_block *clearpad_evgen_block_get(u8 module_id, u8 rev)
+{
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
+	return evgen_blocks;
+#else
+	return NULL;
+#endif
 }
 
 static void synaptics_clearpad_set_irq(struct synaptics_clearpad *this,
@@ -1826,9 +1890,7 @@ static int synaptics_clearpad_set_suspend_mode(struct synaptics_clearpad *this)
 
 	dev_dbg(&this->pdev->dev, "%s\n", __func__);
 
-
 	if (this->easy_wakeup_config.gesture_enable) {
-		printk("Someone was here");
 		rc = synaptics_put_bit(this, SYNF(F11_2D, CTRL, 0x00),
 			XY_REPORTING_MODE_WAKEUP_GESTURE_MODE,
 			XY_REPORTING_MODE);
@@ -1841,7 +1903,6 @@ static int synaptics_clearpad_set_suspend_mode(struct synaptics_clearpad *this)
 		this->ew_timeout = jiffies - 1;
 		usleep_range(10000, 11000);
 		LOG_CHECK(this, "enter doze mode\n");
-		
 	} else {
 		rc = synaptics_put_bit(this, SYNF(F01_RMI, CTRL, 0x00),
 			DEVICE_CONTROL_SLEEP_MODE_SENSOR_SLEEP,
@@ -2213,31 +2274,6 @@ static void synaptics_funcarea_down(struct synaptics_clearpad *this,
 	}
 }
 
-static int get_num_fingers_f12(struct synaptics_clearpad *this,
-	int *num_fingers)
-{
-	int rc, num;
-	u16 val, mask;
-	const int max_objects = this->extents.n_fingers;
-
-	rc = synaptics_read(SYNF2(this, F12_2D, DATA, OBJ_ATTENTION),
-		(u8 *)&val, sizeof(val));
-	if (rc)
-		goto error;
-
-	val = le16_to_cpu(val);
-
-	for (num = 0, mask = 0x1; num < max_objects; num++, mask <<= 1)
-		if (val < mask)
-			break;
-
-	*num_fingers = num;
-
-	dev_dbg(&this->pdev->dev, "fingers=%d, 0x%04hX", num, val);
-error:
-	return rc;
-}
-
 static void synaptics_funcarea_up(struct synaptics_clearpad *this,
 				  struct synaptics_pointer *pointer)
 {
@@ -2259,17 +2295,25 @@ static void synaptics_funcarea_up(struct synaptics_clearpad *this,
 		LOG_EVENT(this, "%s up\n", valid ? "pt" : "unused pt");
 		if (!valid)
 			break;
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
+		if (this->easy_wakeup_config.gesture_enable && !lcd_on && cur->id == 0) {
+			LOG_CHECK(this, "D2W: difference: %llu", ktime_to_ms(ktime_get()) - d2w_previous_time);
+			if ((ktime_to_ms(ktime_get()) - d2w_previous_time) > DOUBLE_TAP_TO_WAKE_TIMEOUT) {
+				/* Not sure if using this->easy_wakeup_config.timeout_delay is wise, where is it set from? */
+				d2w_previous_time = ktime_to_ms(ktime_get());
+			} else {
+				if (is_close_to_previous_hit(cur->x, cur->y)) {
+					LOG_CHECK(this, "D2W: Unlock!");
+					evgen_execute(this->input, this->evgen_blocks, "double_tap");
+				} else {
+					LOG_CHECK(this, "D2W: Second tap too far off");
+				}
+			}
 
-		if (this->easy_wakeup_config.gesture_enable && !lcd_on) {
- 			LOG_CHECK(this, "D2W: difference: %u", jiffies_to_msecs(d2w_timeout) - jiffies_to_msecs(jiffies));
- 			if (time_after(jiffies, d2w_timeout)) {
- 				d2w_timeout = jiffies + msecs_to_jiffies(this->easy_wakeup_config.timeout_delay);
- 				LOG_CHECK(this, "D2W: now: %u | new timeout: %u", jiffies_to_msecs(jiffies), jiffies_to_msecs(d2w_timeout));
- 			} else {
- 				LOG_CHECK(this, "D2W: Unlock!");
- 				evdt_execute(this->evdt_node, this->input, 0102);
- 			}
- 		}			
+			previous_x = cur->x;
+			previous_y = cur->y;
+		}
+#endif
 		input_mt_slot(idev, pointer->cur.id);
 		input_mt_report_slot_state(idev, pointer->cur.tool, false);
 		break;
@@ -2516,6 +2560,31 @@ exit:
 	return rc;
 }
 
+static int get_num_fingers_f12(struct synaptics_clearpad *this,
+	int *num_fingers)
+{
+	int rc, num;
+	u16 val, mask;
+	const int max_objects = this->extents.n_fingers;
+
+	rc = synaptics_read(SYNF2(this, F12_2D, DATA, OBJ_ATTENTION),
+		(u8 *)&val, sizeof(val));
+	if (rc)
+		goto error;
+
+	val = le16_to_cpu(val);
+
+	for (num = 0, mask = 0x1; num < max_objects; num++, mask <<= 1)
+		if (val < mask)
+			break;
+
+	*num_fingers = num;
+
+	dev_dbg(&this->pdev->dev, "fingers=%d, 0x%04hX", num, val);
+error:
+	return rc;
+}
+
 static int synaptics_clearpad_read_fingers_f12(struct synaptics_clearpad *this)
 {
 	int rc, finger, num_fingers;
@@ -2558,9 +2627,24 @@ static int synaptics_clearpad_handle_gesture(struct synaptics_clearpad *this)
 			this->easy_wakeup_config.timeout_delay);
 	else
 		goto exit;
-	
-	evdt_execute(this->evdt_node, this->input, wakeint);
-	
+
+	switch (wakeint) {
+	case XY_LPWG_STATUS_DOUBLE_TAP_DETECTED:
+		rc = evgen_execute(this->input, this->evgen_blocks,
+					"double_tap");
+		break;
+	case XY_LPWG_STATUS_SWIPE_DETECTED:
+		rc = evgen_execute(this->input, this->evgen_blocks,
+					"single_swipe");
+		break;
+	case XY_LPWG_STATUS_TWO_SWIPE_DETECTED:
+		rc = evgen_execute(this->input, this->evgen_blocks,
+					"two_swipe");
+		break;
+	default:
+		dev_info(&this->pdev->dev, "Gesture %d Not supported", wakeint);
+		break;
+	}
 exit:
 	return rc;
 }
@@ -2619,7 +2703,6 @@ static int synaptics_clearpad_process_F11_2D(struct synaptics_clearpad *this)
 	if (this->easy_wakeup_config.gesture_enable &&
 	    !(this->active & SYN_ACTIVE_POWER)) {
 		rc = synaptics_clearpad_handle_gesture(this);
-	printk("Looks like no one came here");
 		goto exit;
 	}
 
@@ -3214,7 +3297,11 @@ enable:
 	rc = request_threaded_irq(this->irq,
 				synaptics_clearpad_hard_handler,
 				synaptics_clearpad_threaded_handler,
-				IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+				IRQF_TRIGGER_FALLING | IRQF_ONESHOT
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
+				| IRQF_NO_SUSPEND | IRQF_EARLY_RESUME
+#endif
+				,
 				this->pdev->dev.driver->name,
 				&this->pdev->dev);
 	if (rc) {
@@ -3387,19 +3474,6 @@ static void clearpad_touch_config_dt(struct synaptics_clearpad *this)
 	if (of_property_read_u32(devnode, "por_delay_after",
 		&this->por_delay_after))
 		dev_warn(&this->pdev->dev, "no por_delay_after config\n");
-
-	if (of_property_read_bool(devnode, "large_panel"))
-		this->easy_wakeup_config.large_panel = true;
-	else
-		dev_warn(&this->pdev->dev, "no large_panel\n");
-
-	if (of_property_read_u32(devnode, "wakeup_gesture_support",
-		&this->wakeup_gesture_support))
-		dev_warn(&this->pdev->dev, "no wakeup_gesture_support\n");
-
-	if (of_property_read_u32(devnode, "wakeup_gesture_timeout",
-		&this->easy_wakeup_config.timeout_delay))
-		dev_warn(&this->pdev->dev, "no wakeup_gesture_timeout\n");
 }
 
 static int synaptics_clearpad_input_init(struct synaptics_clearpad *this,
@@ -3428,27 +3502,26 @@ exit:
 	return rc;
 }
 
-static void synaptics_clearpad_input_ev_init(struct synaptics_clearpad *this)
+static int synaptics_clearpad_input_ev_init(struct synaptics_clearpad *this)
 {
 	int rc = 0;
 
-	if (this->wakeup_gesture_support) {
-		this->evdt_node = evdt_initialize(this->bdata->dev, this->input,
-						SYNAPTICS_WAKEUP_GESTURE);
-		if (!this->evdt_node) {
-			dev_err(&this->pdev->dev, "no wakeup_gesture dt\n");
-		} else {
-			rc = device_create_file(&this->input->dev,
-					&clearpad_wakeup_gesture_attr);
-			if (rc)
-				dev_err(&this->pdev->dev,
-					"sysfs_create_file failed: %d\n", rc);
+	this->evgen_blocks = clearpad_evgen_block_get(
+		this->device_info.customer_family,
+		this->device_info.firmware_revision_major);
+	dev_info(&this->pdev->dev, "evgen_blocks is %s\n",
+		 this->evgen_blocks ? "used" : "null");
+	evgen_initialize(this->input, this->evgen_blocks);
 
-			dev_info(&this->pdev->dev, "Touch Wakeup Feature OK\n");
-			device_init_wakeup(&this->pdev->dev, 0);
-		}
+	if (this->evgen_blocks) {
+		rc = device_create_file(&this->input->dev,
+				&clearpad_wakeup_gesture_attr);
+		if (rc)
+			dev_err(&this->pdev->dev,
+				"sysfs_create_file failed: %d\n", rc);
 	}
 
+	return rc;
 }
 
 static int synaptics_clearpad_suspend(struct device *dev)
@@ -3559,7 +3632,7 @@ static int synaptics_clearpad_pm_resume(struct device *dev)
 static int synaptics_clearpad_pm_suspend_noirq(struct device *dev)
 {
 	struct synaptics_clearpad *this = dev_get_drvdata(dev);
-	if (this->irq_pending && device_may_wakeup(dev)) {
+	if ((this->irq_pending && device_may_wakeup(dev)) || this->easy_wakeup_config.gesture_enable) {
 		dev_info(&this->pdev->dev, "Need to resume\n");
 		return -EBUSY;
 	}
@@ -4183,6 +4256,11 @@ static int __devinit clearpad_probe(struct platform_device *pdev)
 			this->pdata->easy_wakeup_config,
 			sizeof(this->easy_wakeup_config));
 
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
+	this->easy_wakeup_config.gesture_enable = true;
+	this->easy_wakeup_config.timeout_delay = DOUBLE_TAP_TO_WAKE_TIMEOUT;
+#endif
+
 #ifdef CONFIG_TOUCHSCREEN_CLEARPAD_RMI_DEV
 	if (!cdata->rmi_dev) {
 		rmi_dev = platform_device_alloc(CLEARPAD_RMI_DEV_NAME, -1);
@@ -4280,7 +4358,9 @@ static int __devinit clearpad_probe(struct platform_device *pdev)
 		goto err_input_device;
 	}
 
-	synaptics_clearpad_input_ev_init(this);
+	rc = synaptics_clearpad_input_ev_init(this);
+	if (rc)
+		goto err_input_device_pen;
 
 	this->state = SYN_STATE_RUNNING;
 
@@ -4318,7 +4398,11 @@ static int __devinit clearpad_probe(struct platform_device *pdev)
 	rc = request_threaded_irq(this->irq,
 				synaptics_clearpad_hard_handler,
 				synaptics_clearpad_threaded_handler,
-				IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+				IRQF_TRIGGER_FALLING | IRQF_ONESHOT
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
+				| IRQF_NO_SUSPEND | IRQF_EARLY_RESUME
+#endif
+				,
 				this->pdev->dev.driver->name,
 				&this->pdev->dev);
 	if (rc) {
@@ -4348,6 +4432,8 @@ err_unregister_fb:
 #ifdef CONFIG_FB
 	fb_unregister_client(&this->fb_notif);
 #endif
+err_input_device_pen:
+	input_unregister_device(this->input_pen);
 err_input_device:
 	input_unregister_device(this->input);
 err_gpio_teardown:
@@ -4429,14 +4515,18 @@ static struct platform_driver clearpad_driver = {
 
 static int __init clearpad_init(void)
 {
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
 	d2w_lcd_notif.notifier_call = lcd_notifier_callback;
 	lcd_register_client(&d2w_lcd_notif);
+#endif
 	return platform_driver_register(&clearpad_driver);
 }
 
 static void __exit clearpad_exit(void)
 {
+#ifdef CONFIG_TOUCHSCREEN_DOUBLE_TAP_TO_WAKE
 	lcd_unregister_client(&d2w_lcd_notif);
+#endif
 	platform_driver_unregister(&clearpad_driver);
 }
 
